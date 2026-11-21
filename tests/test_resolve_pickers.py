@@ -262,10 +262,47 @@ class TestClientChain(unittest.TestCase):
         self.assertEqual(rp.p2_appid(ctx), (a + 0xA4, None))
 
     def test_pipeclient(self):
-        a, b = 0xA001, 0xA002
-        ctx = mkctx(entries=[a, b], sizes={a: 0x150, b: 0x150},
-                    e8={a + 0xA0: 15, b + 0xA0: 0})
-        self.assertEqual(rp.p2_pipeclient(ctx), (a + 0xA0, None))
+        base, size, text_off = 0xA000, 0x200, 0x100
+        body = bytearray(b"\x90" * size)
+        body[0xA0:0xA0 + len(rp.PIPECLIENT_PATTERN)] = bytes(
+            0x90 if b is None else b for b in rp.PIPECLIENT_PATTERN)
+        # The two short branches may move while the instruction shape stays.
+        body[0xA3], body[0xAD] = 0x44, 0x22
+        buf = bytearray(text_off + len(body))
+        buf[text_off:] = body
+        img = SimpleNamespace(
+            buf=buf, traw=text_off, trawsz=len(body), tva=base,
+            rva2off=lambda rva: text_off + rva - base
+            if base <= rva < base + len(body) else None)
+        ctx = SimpleNamespace(
+            img=img,
+            func_of=lambda rva: base if base <= rva < base + size else None,
+            func_size=lambda entry: size if entry == base else 0,
+            pdata_root=lambda entry: entry if entry == base else None,
+        )
+        self.assertEqual(rp.p2_pipeclient(ctx), (base + 0xA0, None))
+
+    def test_pipeclient_ignores_matches_outside_owner_span(self):
+        base, size, text_off = 0xA000, 0x80, 0x100
+        body = bytearray(b"\x90" * 0x200)
+        body[0xA0:0xA0 + len(rp.PIPECLIENT_PATTERN)] = bytes(
+            0x90 if b is None else b for b in rp.PIPECLIENT_PATTERN)
+        body[0xA3], body[0xAD] = 0x44, 0x22
+        buf = bytearray(text_off + len(body))
+        buf[text_off:] = body
+        img = SimpleNamespace(
+            buf=buf, traw=text_off, trawsz=len(body), tva=base,
+            rva2off=lambda rva: text_off + rva - base
+            if base <= rva < base + len(body) else None)
+        ctx = SimpleNamespace(
+            img=img,
+            func_of=lambda rva: base if base <= rva < base + size else None,
+            func_size=lambda entry: size if entry == base else 0,
+            pdata_root=lambda entry: entry if entry == base else None,
+        )
+        rva, error = rp.p2_pipeclient(ctx)
+        self.assertIsNone(rva)
+        self.assertIn("0 GetPipeClient cands", error)
 
     def test_getoradd(self):
         ctx = mkctx(callees={0x1: {0xA, 0xB}}, sizes={0xA: 0x8, 0xB: 0x40},

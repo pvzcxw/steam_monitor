@@ -107,6 +107,27 @@ class TestCheckWrapper(unittest.TestCase):
         self.assertFalse(ri.check_wrapper(img, WRAP, "D6FC3200", set(entries)))
 
 
+class TestExtractWireConstants(unittest.TestCase):
+    @staticmethod
+    def _append_u32(value):
+        return (bytes.fromhex("41 B8 04 00 00 00 C7 44 24 20")
+                + value.to_bytes(4, "little")
+                + bytes.fromhex("48 8D 54 24 20 48 8D 4C 24 30"
+                                " E8 00 00 00 00"))
+
+    def test_extracts_only_immediates_serialized_as_u32(self):
+        code = (bytes.fromhex("B8 11 22 33 44")
+                + self._append_u32(0x09607EC2)
+                + self._append_u32(0x0AFEF352))
+        self.assertEqual(
+            ri.extract_serialized_u32_constants(code, 0x1000),
+            [0x09607EC2, 0x0AFEF352])
+
+    def test_unserialized_immediates_are_ignored(self):
+        code = bytes.fromhex("B8 11 22 33 44 48 83 C4 20 C3")
+        self.assertEqual(ri.extract_serialized_u32_constants(code, 0x1000), [])
+
+
 class TestResolveIface(unittest.TestCase):
     SPEC = {"id": 1, "td": TD,
             "methods": [("GetSteamID", 10, "D6FC3200", "D7058CA5", 0)]}
@@ -126,6 +147,36 @@ class TestResolveIface(unittest.TestCase):
             self.SPEC, img, SPANS, BASE, set(entries))
         self.assertIsNone(vt)
         self.assertIn("fails hash check", err)
+
+    def test_getappid_wire_hash_is_derived_from_wrapper(self):
+        img = FlatImg()
+        img.put(TD_RVA, b"\x00" * 16 + ri.IPC_IFACES["IClientUtils"]["td"] + b"\x00")
+        img.put(COL_RVA, struct.pack(
+            "<IIIII", 1, 0, 0, TD_RVA, 0x9999))
+        img.put(VT_RVA - 8, struct.pack("<Q", BASE + COL_RVA))
+        img.put(VT_RVA + 19 * 8, struct.pack("<Q", BASE + WRAP))
+
+        def append_u32(value):
+            return (bytes.fromhex("41 B8 04 00 00 00 C7 44 24 20")
+                    + value.to_bytes(4, "little")
+                    + bytes.fromhex("48 8D 54 24 20 48 8D 4C 24 30"
+                                    " E8 00 00 00 00"))
+
+        code = (bytes.fromhex("B8 11 22 33 44")
+                + append_u32(0x12345678)
+                + append_u32(0xABCDEF01))
+        img.put(WRAP, code)
+        spec = ri.channel_spec(
+            "IClientUtils", ri.IPC_IFACES["IClientUtils"], "beta")
+        spec["methods"] = spec["methods"][:1]
+        vt, methods, err = ri.resolve_iface(
+            spec, img, SPANS, BASE, {WRAP}, {WRAP: len(code)})
+
+        self.assertIsNone(err)
+        self.assertEqual(vt, VT_RVA)
+        self.assertEqual(methods, {"GetAppID": WRAP})
+        self.assertEqual(spec["methods"][0],
+                         ("GetAppID", 19, "12345678", "ABCDEF01", 0))
 
 
 class TestRenderToml(unittest.TestCase):

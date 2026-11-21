@@ -109,6 +109,13 @@ GPI_PREFIX = bytes.fromhex(
 # 6980e1cd beta gained a second exact-ref-set twin with a different prologue).
 CUBEC_PREFIX = bytes.fromhex(
     "48 89 5C 24 08 57 48 83 EC 30 48 8B D9 8D 7A 01 0F B6 49 1F")
+# GetPipeClient's stable instruction shape. Short-branch displacements are
+# wildcarded because harmless block-layout changes can alter them.
+PIPECLIENT_PATTERN = (
+    0x85, 0xD2, 0x74, None, 0x44, 0x0F, 0xB7, 0xCA,
+    0x44, 0x3B, 0x49, 0x60, 0x73, None, 0x48, 0x8B,
+    0x41, 0x40, 0x45, 0x8B, 0xC1, 0x4D, 0x03, 0xC0,
+)
 
 
 # Prologue byte pin per side/hook, applied after candidate selection.
@@ -374,11 +381,30 @@ def p2_appid(ctx):
 
 
 def p2_pipeclient(ctx):
-    cands = [t for t in ctx.entries
-             if not ctx.refs_by_func().get(t) and ctx.func_size(t) == 0x150]
-    counts = ctx.e8_count_many({t + 0xA0 for t in cands})
-    hot = [t + 0xA0 for t in cands if counts[t + 0xA0] >= 5]
-    return _only(hot, "GetPipeClient cands")
+    img = ctx.img
+    pat = PIPECLIENT_PATTERN
+    lo, hi = img.traw, min(img.traw + img.trawsz, len(img.buf))
+    matches = []
+    anchor = bytes(pat[:3])
+    i = lo
+    while True:
+        i = img.buf.find(anchor, i, hi - len(pat) + len(anchor) + 1)
+        if i < 0:
+            break
+        if all(want is None or img.buf[i + j] == want
+               for j, want in enumerate(pat)):
+            rva = img.tva + (i - img.traw)
+            entry = ctx.func_of(rva)
+            # Some short leaf helpers have no independent unwind entry. Their
+            # bytes can live in the .pdata gap before the next function entry,
+            # so bound this anchor by the next-entry span after validating the
+            # owning entry itself.
+            size = ctx.func_size(entry) if entry is not None else 0
+            if entry is not None and ctx.pdata_root(entry) is not None \
+                    and entry <= rva and rva + len(pat) <= entry + size:
+                matches.append(rva)
+        i += 1
+    return _only(matches, "GetPipeClient cands")
 
 
 def p2_getoradd(ctx, ga, cm):

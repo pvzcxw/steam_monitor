@@ -194,16 +194,91 @@ def find_vtable(img, spans, td_rva, base):
     return next(iter(match)), None
 
 
-def check_wrapper(img, func_rva, funchash: str, pdata) -> bool:
+def check_wrapper(img, func_rva, funchash: str, pdata,
+                  pdata_sizes=None) -> bool:
     if func_rva not in pdata:
         return False
     o = img.rva2off(func_rva)
     if o is None:
         return False
-    return bytes.fromhex(funchash)[::-1] in bytes(img.buf[o:o + HASH_WINDOW])
+    window = HASH_WINDOW
+    if pdata_sizes is not None:
+        size = pdata_sizes.get(func_rva, 0)
+        if size <= 0:
+            return False
+        window = min(window, size)
+    return bytes.fromhex(funchash)[::-1] in bytes(img.buf[o:o + window])
 
 
-def resolve_iface(spec, img, spans, base, pdata):
+def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
+    """Extract stack u32 literals serialized through a 4-byte IPC append.
+
+    IPC wrappers place each wire constant in a stack temporary, pass that
+    temporary as RDX with R8D=4, then call the common append helper. Requiring
+    that instruction shape avoids treating unrelated immediates as hashes.
+    """
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+    from capstone.x86_const import (
+        X86_INS_CALL, X86_INS_LEA, X86_INS_MOV,
+        X86_OP_IMM, X86_OP_MEM, X86_OP_REG,
+        X86_REG_R8D, X86_REG_RDX, X86_REG_RSP,
+    )
+
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    md.detail = True
+    instructions = list(md.disasm(code, base_rva))
+    values = []
+    for index, ins in enumerate(instructions):
+        if ins.id != X86_INS_MOV or len(ins.operands) != 2:
+            continue
+        dst, src = ins.operands
+        if (dst.type != X86_OP_MEM or dst.size != 4
+                or dst.mem.base != X86_REG_RSP or dst.mem.index != 0
+                or src.type != X86_OP_IMM):
+            continue
+
+        window_start = max(0, index - 2)
+        window_end = min(len(instructions), index + 7)
+        window = instructions[window_start:window_end]
+        append_ptr = False
+        append_size = False
+        append_call = False
+        for candidate in window:
+            if candidate.address <= ins.address:
+                if (candidate.id == X86_INS_MOV and len(candidate.operands) == 2
+                        and candidate.operands[0].type == X86_OP_REG
+                        and candidate.operands[0].reg == X86_REG_R8D
+                        and candidate.operands[1].type == X86_OP_IMM
+                        and candidate.operands[1].imm == 4):
+                    append_size = True
+                continue
+            if candidate.id == X86_INS_LEA and len(candidate.operands) == 2:
+                dst_reg, src_mem = candidate.operands
+                if (dst_reg.type == X86_OP_REG and dst_reg.reg == X86_REG_RDX
+                        and src_mem.type == X86_OP_MEM
+                        and src_mem.mem.base == X86_REG_RSP
+                        and src_mem.mem.index == 0
+                        and src_mem.mem.disp == dst.mem.disp):
+                    append_ptr = True
+            elif candidate.id == X86_INS_CALL and append_ptr:
+                append_call = True
+                break
+        if append_ptr and append_size and append_call:
+            values.append(src.imm & 0xFFFFFFFF)
+    return values
+
+
+def serialized_u32_constants(img, func_rva, pdata_sizes):
+    size = pdata_sizes.get(func_rva, 0)
+    off = img.rva2off(func_rva)
+    if size <= 0 or off is None:
+        return []
+    end = min(off + size, len(img.buf))
+    return extract_serialized_u32_constants(
+        bytes(img.buf[off:end]), func_rva)
+
+
+def resolve_iface(spec, img, spans, base, pdata, pdata_sizes=None):
     td = find_td(img, spans, spec["td"])
     if td is None:
         return None, None, f'no TD {spec["td"]!r}'
@@ -211,12 +286,28 @@ def resolve_iface(spec, img, spans, base, pdata):
     if err is not None:
         return None, None, err
     methods = {}
-    for name, idx, funchash, _fence, _argc in spec["methods"]:
+    for method_index, (name, idx, funchash, fence, argc) in enumerate(
+            list(spec["methods"])):
         f = _u64(img, vt + idx * 8)
         if f is None:
             return None, None, f"slot {idx} unreadable"
         f -= base
-        if not check_wrapper(img, f, funchash, pdata):
+
+        # GetAppID's wire constants roll independently on stable/beta. Derive
+        # them from the vtable-selected wrapper rather than accepting a stale
+        # channel constant when this build changes.
+        if name == "GetAppID" and pdata_sizes is not None:
+            wire = serialized_u32_constants(img, f, pdata_sizes)
+            if len(wire) != 2:
+                return None, None, (
+                    f"{name}: couldn't extract funcHash/fencepost from "
+                    f"wrapper {f:#x} (found {len(wire)} serialized u32 values)")
+            funchash, fence = (f"{wire[0]:08X}", f"{wire[1]:08X}")
+            methods_spec = list(spec["methods"])
+            methods_spec[method_index] = (name, idx, funchash, fence, argc)
+            spec["methods"] = methods_spec
+            spec.setdefault("wire_constants_updated", []).append(name)
+        if not check_wrapper(img, f, funchash, pdata, pdata_sizes):
             return None, None, f"{name}: wrapper {f:#x} fails hash check"
         methods[name] = f
     return vt, methods, None
@@ -246,12 +337,15 @@ def cmd_resolve(args):
         print("FAIL: no data sections")
         return 1
     base = image_base(img.buf)
-    entries = sorted(img.pdata_entries())
+    pdata_ranges = img.pdata_ranges()
+    entries = sorted(begin for begin, _end in pdata_ranges)
     pdata = set(entries)
+    pdata_sizes = {begin: end - begin for begin, end in pdata_ranges}
     resolved, failed = [], []
     for iface, base_spec in IPC_IFACES.items():
         spec = channel_spec(iface, base_spec, args.channel)
-        vt, methods, err = resolve_iface(spec, img, spans, base, pdata)
+        vt, methods, err = resolve_iface(
+            spec, img, spans, base, pdata, pdata_sizes)
         if err is not None:
             failed.append((iface, err))
             print(f"FAIL {iface}: {err}")
@@ -259,6 +353,10 @@ def cmd_resolve(args):
             resolved.append((iface, spec, vt, methods))
             print(f"{iface}: vtable=0x{vt:X} " +
                   " ".join(f"{m}=0x{w:X}" for m, w in methods.items()))
+            for method in spec.get("wire_constants_updated", ()):
+                values = next(m for m in spec["methods"] if m[0] == method)
+                print(f"AUTO {iface}.{method}: funcHash=0x{values[2]} "
+                      f"fencepost=0x{values[3]}")
     if args.verify:
         truth = tomllib.load(open(args.verify, "rb"))
         for iface, spec, vt, methods in resolved:
