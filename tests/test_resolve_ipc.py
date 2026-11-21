@@ -127,6 +127,18 @@ class TestExtractWireConstants(unittest.TestCase):
         code = bytes.fromhex("B8 11 22 33 44 48 83 C4 20 C3")
         self.assertEqual(ri.extract_serialized_u32_constants(code, 0x1000), [])
 
+    def test_extracts_rbp_relative_stack_constants(self):
+        def append_u32(value):
+            return (bytes.fromhex("41 B8 04 00 00 00 C7 45 20")
+                    + value.to_bytes(4, "little")
+                    + bytes.fromhex("48 8D 55 20 48 8D 4D 30"
+                                    " E8 00 00 00 00"))
+
+        code = append_u32(0xD6FC3200) + append_u32(0xD7058CA5)
+        self.assertEqual(
+            ri.extract_serialized_u32_constants(code, 0x1000),
+            [0xD6FC3200, 0xD7058CA5])
+
 
 class TestResolveIface(unittest.TestCase):
     SPEC = {"id": 1, "td": TD,
@@ -177,6 +189,27 @@ class TestResolveIface(unittest.TestCase):
         self.assertEqual(methods, {"GetAppID": WRAP})
         self.assertEqual(spec["methods"][0],
                          ("GetAppID", 19, "12345678", "ABCDEF01", 0))
+
+    def test_getsteamid_wire_pair_is_derived_from_rbp_wrapper(self):
+        img, _ = mkimg()
+
+        def append_u32(value):
+            return (bytes.fromhex("41 B8 04 00 00 00 C7 45 20")
+                    + value.to_bytes(4, "little")
+                    + bytes.fromhex("48 8D 55 20 48 8D 4D 30"
+                                    " E8 00 00 00 00"))
+
+        code = append_u32(0x11223344) + append_u32(0x55667788)
+        img.put(WRAP, code)
+        spec = {**self.SPEC, "methods": list(self.SPEC["methods"])}
+        vt, methods, err = ri.resolve_iface(
+            spec, img, SPANS, BASE, {WRAP}, {WRAP: len(code)})
+
+        self.assertIsNone(err)
+        self.assertEqual(vt, VT_RVA)
+        self.assertEqual(methods, {"GetSteamID": WRAP})
+        self.assertEqual(spec["methods"][0],
+                         ("GetSteamID", 10, "11223344", "55667788", 0))
 
 
 class TestRenderToml(unittest.TestCase):

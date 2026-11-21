@@ -27,12 +27,11 @@ Blocked-run triage notes:
   prologue, or function-size pin. Calls are instruction-decoded inside exact
   `.pdata` ranges; malformed/cyclic chains and missing or ambiguous topology
   fail closed and must be reviewed before publishing that build.
-- IPC funcHash/fencepost re-rolls: `IClientUtils.GetAppID` derives its two
-  serialized u32 constants from the selected wrapper, so channel rollovers do
-  not stale that entry. For other IPC methods, extract re-rolled constants
-  from the wrapper's outgoing-buffer writes — each stack `mov dword ptr [..],
-  imm32` followed by the 4-byte append helper (`call <helper>`); update that
-  channel's `IPC_CONSTANTS` entry in `tools/resolve_ipc.py` and re-run.
+- IPC funcHash/fencepost re-rolls: every method derives its two serialized
+  u32 constants from the wrapper selected through that build's vtable. This
+  avoids stale channel-specific seeds. If extraction fails, inspect the
+  wrapper's outgoing-buffer writes: each stack `mov dword ptr [..], imm32`
+  followed by the 4-byte append helper (`call <helper>`).
 - Phase-2 window misses: `p2_findcreate` scans the 64KB page holding
   `KeyValues_ReadAsBinary`, assuming the KeyValues helpers stay on one page.
   When the block shifts and the two land on opposite sides of a boundary

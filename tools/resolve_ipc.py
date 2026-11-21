@@ -5,10 +5,9 @@ per-interface [Name] (interface_id, vtable_rva) plus per-method
 [Name.Method] (method_index, funcHash, wrapper_rva, fencepost, argc).
 
 funcHash / fencepost values are wire constants the wrapper writes into the
-outgoing IPC buffer (4-byte appends). They are NOT build-stable, and stable
-and beta roll them independently: the 1792192922 beta re-rolled five of six
-methods while stable kept the old pair. Select the channel's set with
---channel. Re-derive on failure: disassemble the slot's wrapper, find each
+outgoing IPC buffer (4-byte appends). They are NOT build-stable. Every pair
+is extracted from the wrapper selected through this build's vtable. Re-derive
+on failure: inspect the slot's wrapper, find each
 `mov dword ptr [..], imm32` followed by the 4-byte append helper call; first
 immediate = funcHash, second = fencepost. Only the two RVAs resolve per
 build. Resolution chain per interface, all asserted unique (FAIL loudly):
@@ -64,8 +63,9 @@ IPC_IFACES = {
     },
 }
 
-# Per-channel wire constants: iface -> method -> (funcHash, fencepost).
-# Stable and beta are separate builds and have re-rolled these independently.
+# Known wire-constant seeds: iface -> method -> (funcHash, fencepost).
+# DLL resolution extracts the current values from the wrapper; these remain
+# reference data for direct helper callers and regression tests.
 IPC_CONSTANTS = {
     "stable": {
         "IClientUser": {
@@ -221,7 +221,7 @@ def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
     from capstone.x86_const import (
         X86_INS_CALL, X86_INS_LEA, X86_INS_MOV,
         X86_OP_IMM, X86_OP_MEM, X86_OP_REG,
-        X86_REG_R8D, X86_REG_RDX, X86_REG_RSP,
+        X86_REG_R8D, X86_REG_RBP, X86_REG_RDX, X86_REG_RSP,
     )
 
     md = Cs(CS_ARCH_X86, CS_MODE_64)
@@ -233,7 +233,8 @@ def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
             continue
         dst, src = ins.operands
         if (dst.type != X86_OP_MEM or dst.size != 4
-                or dst.mem.base != X86_REG_RSP or dst.mem.index != 0
+                or dst.mem.base not in (X86_REG_RSP, X86_REG_RBP)
+                or dst.mem.index != 0
                 or src.type != X86_OP_IMM):
             continue
 
@@ -256,7 +257,7 @@ def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
                 dst_reg, src_mem = candidate.operands
                 if (dst_reg.type == X86_OP_REG and dst_reg.reg == X86_REG_RDX
                         and src_mem.type == X86_OP_MEM
-                        and src_mem.mem.base == X86_REG_RSP
+                        and src_mem.mem.base == dst.mem.base
                         and src_mem.mem.index == 0
                         and src_mem.mem.disp == dst.mem.disp):
                     append_ptr = True
@@ -293,10 +294,12 @@ def resolve_iface(spec, img, spans, base, pdata, pdata_sizes=None):
             return None, None, f"slot {idx} unreadable"
         f -= base
 
-        # GetAppID's wire constants roll independently on stable/beta. Derive
-        # them from the vtable-selected wrapper rather than accepting a stale
-        # channel constant when this build changes.
-        if name == "GetAppID" and pdata_sizes is not None:
+        # IPC wire constants can roll independently on stable/beta. Derive
+        # them from the vtable-selected wrapper rather than accepting stale
+        # channel constants when this build changes. Dynamic method arguments
+        # are loaded from registers, so only the two serialized immediates
+        # (funcHash, fencepost) are returned by the extractor.
+        if pdata_sizes is not None:
             wire = serialized_u32_constants(img, f, pdata_sizes)
             if len(wire) != 2:
                 return None, None, (
