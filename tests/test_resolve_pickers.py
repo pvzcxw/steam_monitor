@@ -34,6 +34,7 @@ def mkctx(entries=(), callees=None, callers=None, refs=None,
         referencing_funcs=lambda s: set((refs or {}).get(s, ())),
         refs_by_func=lambda: dict(rstrings or {}),
         func_size=lambda f: (sizes or {}).get(f, 0x100),
+        pdata_size=lambda f: extra.get("pdata_sizes", {}).get(f, 0),
         vtable_runs=lambda: extra.get("runs", []),
         e8_count_many=lambda pts: {p: extra.get("e8", {}).get(p, 0)
                                    for p in pts},
@@ -341,6 +342,42 @@ class TestGetPackageInfo(unittest.TestCase):
         v, e = rp.p2_getpackageinfo(ctx)
         self.assertIsNone(v)
         self.assertIn("2 GetPackageInfo cands", e)
+
+
+class TestDepotLicenseGate(unittest.TestCase):
+    HOOK, DECOY = 0x9FDA30, 0xA00000
+
+    def _ctx(self, bodies, pdata_sizes):
+        img = Img()
+        for rva, body in bodies:
+            img.put(rva, body)
+        return mkctx(entries=[r for r, _ in bodies], img=img,
+                     pdata_sizes=pdata_sizes)
+
+    def test_requires_exact_pdata_extent_and_prologue(self):
+        good = rp.DEPOT_LICENSE_GATE_PREFIX + b"\x90" * 0x110
+        wrong_size = good
+        wrong_prologue = b"\x90" + good[1:]
+        ctx = self._ctx([(self.HOOK, good), (self.DECOY, wrong_size),
+                         (0xA10000, wrong_prologue)],
+                        {self.HOOK: 0x11F, self.DECOY: 0x120,
+                         0xA10000: 0x11F})
+        self.assertEqual(rp.p2_depotlicensegate(ctx), (self.HOOK, None))
+
+    def test_ambiguous_candidates_fail_closed(self):
+        body = rp.DEPOT_LICENSE_GATE_PREFIX + b"\x90" * 0x110
+        ctx = self._ctx([(self.HOOK, body), (self.DECOY, body)],
+                        {self.HOOK: 0x11F, self.DECOY: 0x11F})
+        rva, err = rp.p2_depotlicensegate(ctx)
+        self.assertIsNone(rva)
+        self.assertIn("2 DepotLicenseGate cands", err)
+
+    def test_no_candidate_fails_closed(self):
+        ctx = self._ctx([(self.HOOK, b"\x90" * 0x120)],
+                        {self.HOOK: 0x11F})
+        rva, err = rp.p2_depotlicensegate(ctx)
+        self.assertIsNone(rva)
+        self.assertIn("0 DepotLicenseGate cands", err)
 
 
 class TestProloguePin(unittest.TestCase):

@@ -20,6 +20,10 @@ Blocked-run triage notes:
 - `steamclient` anchor collisions: candidates can be pinned by prologue
   bytes via `PROLOGUE_PINS` in `tools/resolve_patterns.py` (worked example:
   the 1792192922 beta twins for `CUtlBufferEnsureCapacity`).
+- `DepotLicenseGate` is resolved from its complete .pdata function entry,
+  exact 0x11F-byte unwind extent, and 20-byte prologue. A missing or duplicate
+  candidate fails the whole resolve rather than emitting a stale RVA; review
+  the new build's function boundary before updating this picker.
 - IPC funcHash/fencepost re-rolls: when a wrapper fails its hash check,
   extract the new constants from the wrapper's outgoing-buffer writes —
   each `mov dword ptr [..], imm32` followed by the 4-byte append helper

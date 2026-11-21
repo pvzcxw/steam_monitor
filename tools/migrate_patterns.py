@@ -92,6 +92,19 @@ class Image:
             out.add(begin)
         return sorted(out)
 
+    def pdata_ranges(self) -> list[tuple[int, int]]:
+        """Return valid (begin, end) RVAs from the x64 exception directory."""
+        off = self.rva2off(self.exc_rva)
+        if off is None:
+            return []
+        n = self.exc_sz // 12
+        out = []
+        for i in range(n):
+            begin, end, _ = struct.unpack_from("<III", self.buf, off + i * 12)
+            if begin < end:
+                out.append((begin, end))
+        return sorted(set(out))
+
     def scan(self, sig: list[int | None]) -> list[int]:
         if all(b is None for b in sig):
             return []

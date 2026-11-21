@@ -105,6 +105,12 @@ GROW_PREFIX = bytes.fromhex(
 # GetPackageInfo prologue (20B, disp-free).
 GPI_PREFIX = bytes.fromhex(
     "48 89 5C 24 18 89 54 24 10 55 56 57 48 83 EC 20 44 8B 49 20")
+# DepotLicenseGate is a large register-preserving function. Require both its
+# exact leading bytes and real .pdata extent; matching an E8 immediate or an
+# interior basic block must never become a hook candidate.
+DEPOT_LICENSE_GATE_PREFIX = bytes.fromhex(
+    "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 68")
+DEPOT_LICENSE_GATE_PDATA_SIZE = 0x11F
 # CUtlBufferEnsureCapacity prologue (identical in every published build; the
 # 6980e1cd beta gained a second exact-ref-set twin with a different prologue).
 CUBEC_PREFIX = bytes.fromhex(
@@ -419,6 +425,21 @@ def p2_getpackageinfo(ctx):
     return _only(match, "GetPackageInfo cands")
 
 
+def p2_depotlicensegate(ctx):
+    img = ctx.img
+    n = len(DEPOT_LICENSE_GATE_PREFIX)
+    matches = []
+    for entry in ctx.entries:
+        if ctx.pdata_size(entry) != DEPOT_LICENSE_GATE_PDATA_SIZE:
+            continue
+        off = img.rva2off(entry)
+        if off is None or off + n > len(img.buf):
+            continue
+        if bytes(img.buf[off:off + n]) == DEPOT_LICENSE_GATE_PREFIX:
+            matches.append(entry)
+    return _only(matches, "DepotLicenseGate cands")
+
+
 def fnv1a(s: str) -> int:
     h = 0x811C9DC5
     for b in s.encode():
@@ -454,6 +475,8 @@ class Ctx:
         self._eset = set(self.entries)
         self._sizes = {en: nxt - en for en, nxt in
                        zip(self.entries, self.entries[1:] + [self.entries[-1]])}
+        self._pdata_sizes = {begin: end - begin
+                             for begin, end in self.img.pdata_ranges()}
 
     def func_of(self, rva: int) -> int | None:
         i = bisect.bisect_right(self.entries, rva) - 1
@@ -552,6 +575,10 @@ class Ctx:
 
     def func_size(self, f: int) -> int:
         return self._sizes.get(f, 0)
+
+    def pdata_size(self, f: int) -> int:
+        """Exact runtime-function extent, unlike func_size's next-entry span."""
+        return self._pdata_sizes.get(f, 0)
 
     def e8_srcs(self, target: int) -> set[int]:
         # Verified E8s only: re-checks each hit against the source func's
@@ -831,6 +858,7 @@ def resolve(ctx: Ctx, side: str):
                     emit("KeyValues_FindOrCreateKey",
                          *p2_findcreate(ctx, rb, cm))
         emit("ProcessPendingLicenseUpdates", *p2_pplu(ctx))
+        emit("DepotLicenseGate", *p2_depotlicensegate(ctx))
         emit("RecvPkt", *p2_recvpkt(ctx))
         emit("GetAppIDForCurrentPipe", *p2_appid(ctx))
         emit("GetPipeClient", *p2_pipeclient(ctx))
