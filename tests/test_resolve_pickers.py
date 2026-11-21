@@ -35,6 +35,10 @@ def mkctx(entries=(), callees=None, callers=None, refs=None,
         refs_by_func=lambda: dict(rstrings or {}),
         func_size=lambda f: (sizes or {}).get(f, 0x100),
         pdata_size=lambda f: extra.get("pdata_sizes", {}).get(f, 0),
+        pdata_root=lambda f: extra.get("pdata_roots", {}).get(f, f),
+        pdata_chunks=lambda f: extra.get("pdata_chunks", {}).get(f, [f]),
+        direct_callees=lambda f: set((extra.get("direct_callees", callees or {})
+                                     ).get(f, ())),
         vtable_runs=lambda: extra.get("runs", []),
         e8_count_many=lambda pts: {p: extra.get("e8", {}).get(p, 0)
                                    for p in pts},
@@ -126,9 +130,10 @@ class TestGrow(unittest.TestCase):
 class TestBuildDepot(unittest.TestCase):
     HOOK, STRFUNC = 0x4C3820, 0x4C383E
 
-    def test_prev_entry_is_hook(self):
+    def test_chained_string_ref_resolves_primary_function(self):
         ctx = mkctx(entries=[self.HOOK, self.STRFUNC],
-                    refs={rp.BD_STR: {self.STRFUNC}})
+                    refs={rp.BD_STR: {self.STRFUNC}},
+                    pdata_roots={self.STRFUNC: self.HOOK})
         self.assertEqual(rp.p2_builddepot(ctx), (self.HOOK, None))
 
     def test_no_ref_fails(self):
@@ -136,6 +141,14 @@ class TestBuildDepot(unittest.TestCase):
         v, e = rp.p2_builddepot(ctx)
         self.assertIsNone(v)
         self.assertIn("0 BuildDepot referrers", e)
+
+    def test_invalid_pdata_chain_fails(self):
+        ctx = mkctx(entries=[self.HOOK, self.STRFUNC],
+                    refs={rp.BD_STR: {self.STRFUNC}},
+                    pdata_roots={self.STRFUNC: None})
+        v, e = rp.p2_builddepot(ctx)
+        self.assertIsNone(v)
+        self.assertIn("invalid .pdata chain", e)
 
     def test_checkapp_min_callers(self):
         ctx = mkctx(callees={self.STRFUNC: {0x4B3EE0, 0x9CE9E0}},
@@ -345,39 +358,102 @@ class TestGetPackageInfo(unittest.TestCase):
 
 
 class TestDepotLicenseGate(unittest.TestCase):
-    HOOK, DECOY = 0x9FDA30, 0xA00000
+    BUILDDEPOT, BUILDDEPOT_COLD = 0x1000, 0x1010
+    CHECKAPP, GATE, OTHER_GATE, DECOY = 0x2000, 0x3000, 0x4000, 0x5000
 
-    def _ctx(self, bodies, pdata_sizes):
-        img = Img()
-        for rva, body in bodies:
-            img.put(rva, body)
-        return mkctx(entries=[r for r, _ in bodies], img=img,
-                     pdata_sizes=pdata_sizes)
+    def _ctx(self, callees, direct_callees=None):
+        entries = [self.BUILDDEPOT, self.BUILDDEPOT_COLD, self.CHECKAPP,
+                   self.GATE, self.OTHER_GATE, self.DECOY]
+        return mkctx(
+            entries=entries,
+            callees=callees,
+            direct_callees=direct_callees or callees,
+            pdata_roots={self.BUILDDEPOT_COLD: self.BUILDDEPOT},
+            pdata_chunks={self.BUILDDEPOT: [self.BUILDDEPOT,
+                                            self.BUILDDEPOT_COLD]},
+        )
 
-    def test_requires_exact_pdata_extent_and_prologue(self):
-        good = rp.DEPOT_LICENSE_GATE_PREFIX + b"\x90" * 0x110
-        wrong_size = good
-        wrong_prologue = b"\x90" + good[1:]
-        ctx = self._ctx([(self.HOOK, good), (self.DECOY, wrong_size),
-                         (0xA10000, wrong_prologue)],
-                        {self.HOOK: 0x11F, self.DECOY: 0x120,
-                         0xA10000: 0x11F})
-        self.assertEqual(rp.p2_depotlicensegate(ctx), (self.HOOK, None))
+    def test_uses_chained_builddepot_cold_fragment(self):
+        ctx = self._ctx({
+            self.BUILDDEPOT: set(),
+            self.BUILDDEPOT_COLD: {self.GATE, self.CHECKAPP},
+            self.GATE: {self.CHECKAPP},
+            self.DECOY: {self.CHECKAPP},
+        })
+        self.assertEqual(
+            rp.p2_depotlicensegate(ctx, self.BUILDDEPOT, self.CHECKAPP),
+            (self.GATE, None))
 
-    def test_ambiguous_candidates_fail_closed(self):
-        body = rp.DEPOT_LICENSE_GATE_PREFIX + b"\x90" * 0x110
-        ctx = self._ctx([(self.HOOK, body), (self.DECOY, body)],
-                        {self.HOOK: 0x11F, self.DECOY: 0x11F})
-        rva, err = rp.p2_depotlicensegate(ctx)
+    def test_ambiguous_gate_candidates_fail_closed(self):
+        ctx = self._ctx({
+            self.BUILDDEPOT: {self.GATE, self.OTHER_GATE},
+            self.BUILDDEPOT_COLD: set(),
+            self.GATE: {self.CHECKAPP},
+            self.OTHER_GATE: {self.CHECKAPP},
+        })
+        rva, err = rp.p2_depotlicensegate(
+            ctx, self.BUILDDEPOT, self.CHECKAPP)
         self.assertIsNone(rva)
         self.assertIn("2 DepotLicenseGate cands", err)
 
-    def test_no_candidate_fails_closed(self):
-        ctx = self._ctx([(self.HOOK, b"\x90" * 0x120)],
-                        {self.HOOK: 0x11F})
-        rva, err = rp.p2_depotlicensegate(ctx)
+    def test_missing_checkapp_anchor_fails_closed(self):
+        ctx = self._ctx({})
+        rva, err = rp.p2_depotlicensegate(ctx, self.BUILDDEPOT, None)
         self.assertIsNone(rva)
-        self.assertIn("0 DepotLicenseGate cands", err)
+        self.assertIn("CheckAppOwnership unresolved", err)
+
+
+class TestPdataFamilies(unittest.TestCase):
+    def test_nested_chains_share_root_and_cycle_fails_closed(self):
+        ctx = rp.Ctx.__new__(rp.Ctx)
+        ctx.entries = [0x1000, 0x1010, 0x1020, 0x2000, 0x2010, 0x3000]
+        ctx._pdata_records = {
+            0x1000: (0x1008, None),
+            0x1010: (0x1018, 0x1000),
+            0x1020: (0x1028, 0x1010),
+            0x2000: (0x2008, 0x2010),
+            0x2010: (0x2018, 0x2000),
+            0x3000: (0x3008, rp.mp.INVALID_PDATA_CHAIN),
+        }
+        ctx._pdata_roots = {}
+
+        self.assertEqual(ctx.pdata_root(0x1020), 0x1000)
+        self.assertEqual(ctx.pdata_chunks(0x1010), [0x1000, 0x1010, 0x1020])
+        self.assertIsNone(ctx.pdata_root(0x2000))
+        self.assertEqual(ctx.pdata_chunks(0x2010), [])
+        self.assertIsNone(ctx.pdata_root(0x3000))
+
+    def test_direct_call_uses_only_exact_pdata_extent(self):
+        src, target = 0x3000, 0x4000
+        displacement = target - (src + 5)
+        call = b"\xE8" + displacement.to_bytes(4, "little", signed=True)
+        img = Img()
+        img.put(src, call)
+        # A second valid-looking CALL after the source's five-byte pdata range
+        # must not be attributed to this function.
+        img.buf += call
+
+        ctx = rp.Ctx.__new__(rp.Ctx)
+        ctx.img = img
+        ctx.entries = [src, target]
+        ctx._eset = set(ctx.entries)
+        ctx._pdata_sizes = {src: len(call), target: 5}
+        self.assertEqual(ctx.direct_callees(src), {target: 1})
+
+    def test_e8_in_instruction_immediate_is_not_a_call(self):
+        src, target = 0x5000, 0x6000
+        fake_call_disp = target - (src + 2 + 5)
+        mov_rax_imm = b"\x48\xB8\xE8" + fake_call_disp.to_bytes(
+            4, "little", signed=True) + b"\x90\x90\x90"
+        img = Img()
+        img.put(src, mov_rax_imm)
+
+        ctx = rp.Ctx.__new__(rp.Ctx)
+        ctx.img = img
+        ctx.entries = [src, target]
+        ctx._eset = set(ctx.entries)
+        ctx._pdata_sizes = {src: len(mov_rax_imm), target: 5}
+        self.assertEqual(ctx.direct_callees(src), {})
 
 
 class TestProloguePin(unittest.TestCase):

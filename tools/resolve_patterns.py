@@ -105,12 +105,6 @@ GROW_PREFIX = bytes.fromhex(
 # GetPackageInfo prologue (20B, disp-free).
 GPI_PREFIX = bytes.fromhex(
     "48 89 5C 24 18 89 54 24 10 55 56 57 48 83 EC 20 44 8B 49 20")
-# DepotLicenseGate is a large register-preserving function. Require both its
-# exact leading bytes and real .pdata extent; matching an E8 immediate or an
-# interior basic block must never become a hook candidate.
-DEPOT_LICENSE_GATE_PREFIX = bytes.fromhex(
-    "40 55 53 56 57 41 54 41 55 41 56 41 57 48 8B EC 48 83 EC 68")
-DEPOT_LICENSE_GATE_PDATA_SIZE = 0x11F
 # CUtlBufferEnsureCapacity prologue (identical in every published build; the
 # 6980e1cd beta gained a second exact-ref-set twin with a different prologue).
 CUBEC_PREFIX = bytes.fromhex(
@@ -397,7 +391,10 @@ def p2_builddepot(ctx):
     refs = ctx.referencing_funcs(BD_STR)
     if len(refs) != 1:
         return None, f"{len(refs)} BuildDepot referrers"
-    return ctx.entries[ctx.entries.index(next(iter(refs))) - 1], None
+    root = ctx.pdata_root(next(iter(refs)))
+    if root is None:
+        return None, "BuildDepot referrer has invalid .pdata chain"
+    return root, None
 
 
 def p2_checkapp(ctx, cm):
@@ -425,19 +422,30 @@ def p2_getpackageinfo(ctx):
     return _only(match, "GetPackageInfo cands")
 
 
-def p2_depotlicensegate(ctx):
-    img = ctx.img
-    n = len(DEPOT_LICENSE_GATE_PREFIX)
-    matches = []
-    for entry in ctx.entries:
-        if ctx.pdata_size(entry) != DEPOT_LICENSE_GATE_PDATA_SIZE:
-            continue
-        off = img.rva2off(entry)
-        if off is None or off + n > len(img.buf):
-            continue
-        if bytes(img.buf[off:off + n]) == DEPOT_LICENSE_GATE_PREFIX:
-            matches.append(entry)
-    return _only(matches, "DepotLicenseGate cands")
+def p2_depotlicensegate(ctx, builddepot, checkapp):
+    """Find the gate through BuildDepot's logical .pdata function family.
+
+    MSVC emits cold fragments for large functions as chained .pdata records.
+    The gate call can sit in one of those fragments, so inspect every fragment
+    belonging to BuildDepot. The gate itself is the unique direct callee in
+    that family which also calls the already-resolved CheckAppOwnership.
+    """
+    if builddepot is None:
+        return None, "BuildDepotDependency unresolved"
+    if checkapp is None:
+        return None, "CheckAppOwnership unresolved"
+
+    family_callees = set()
+    for fragment in ctx.pdata_chunks(builddepot):
+        family_callees.update(ctx.direct_callees(fragment))
+
+    candidates = {
+        callee for callee in family_callees
+        if callee != checkapp
+        and ctx.pdata_root(callee) == callee
+        and checkapp in ctx.direct_callees(callee)
+    }
+    return _only(candidates, "DepotLicenseGate cands")
 
 
 def fnv1a(s: str) -> int:
@@ -475,8 +483,15 @@ class Ctx:
         self._eset = set(self.entries)
         self._sizes = {en: nxt - en for en, nxt in
                        zip(self.entries, self.entries[1:] + [self.entries[-1]])}
-        self._pdata_sizes = {begin: end - begin
-                             for begin, end in self.img.pdata_ranges()}
+        self._pdata_records = {
+            begin: (end, parent)
+            for begin, end, parent in self.img.pdata_records()
+        }
+        self._pdata_sizes = {
+            begin: end - begin
+            for begin, (end, _) in self._pdata_records.items()
+        }
+        self._pdata_roots = {}
 
     def func_of(self, rva: int) -> int | None:
         i = bisect.bisect_right(self.entries, rva) - 1
@@ -579,6 +594,73 @@ class Ctx:
     def pdata_size(self, f: int) -> int:
         """Exact runtime-function extent, unlike func_size's next-entry span."""
         return self._pdata_sizes.get(f, 0)
+
+    def pdata_root(self, f: int) -> int | None:
+        """Return the primary .pdata entry for a chained function fragment."""
+        if f not in self._pdata_records:
+            return None
+        if f in self._pdata_roots:
+            return self._pdata_roots[f]
+
+        path = []
+        seen = set()
+        current = f
+        while current in self._pdata_records and current not in seen:
+            if current in self._pdata_roots:
+                root = self._pdata_roots[current]
+                break
+            seen.add(current)
+            path.append(current)
+            parent = self._pdata_records[current][1]
+            if parent == mp.INVALID_PDATA_CHAIN:
+                root = None
+                break
+            if parent is None:
+                root = current
+                break
+            if parent not in self._pdata_records:
+                root = None
+                break
+            current = parent
+        else:
+            root = None
+
+        for entry in path:
+            self._pdata_roots[entry] = root
+        return root
+
+    def pdata_chunks(self, function: int) -> list[int]:
+        """All .pdata entries chained to the same primary function entry."""
+        root = self.pdata_root(function)
+        if root is None:
+            return []
+        return [entry for entry in self.entries if self.pdata_root(entry) == root]
+
+    def direct_callees(self, func: int) -> dict[int, int]:
+        """Resolve decoded direct CALLs within one exact .pdata extent."""
+        img = self.img
+        start = img.rva2off(func)
+        size = self.pdata_size(func)
+        if start is None or size < 5:
+            return {}
+        end = min(start + size, len(img.buf))
+        from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+        from capstone.x86_const import X86_INS_CALL, X86_OP_IMM
+
+        md = getattr(self, "_x64_disasm", None)
+        if md is None:
+            md = Cs(CS_ARCH_X86, CS_MODE_64)
+            md.detail = True
+            self._x64_disasm = md
+        out = {}
+        code = img.buf[start:end]
+        for instruction in md.disasm(bytes(code), func):
+            if instruction.id != X86_INS_CALL or len(instruction.operands) != 1:
+                continue
+            operand = instruction.operands[0]
+            if operand.type == X86_OP_IMM and operand.imm in self._eset:
+                out[operand.imm] = out.get(operand.imm, 0) + 1
+        return out
 
     def e8_srcs(self, target: int) -> set[int]:
         # Verified E8s only: re-checks each hit against the source func's
@@ -858,7 +940,6 @@ def resolve(ctx: Ctx, side: str):
                     emit("KeyValues_FindOrCreateKey",
                          *p2_findcreate(ctx, rb, cm))
         emit("ProcessPendingLicenseUpdates", *p2_pplu(ctx))
-        emit("DepotLicenseGate", *p2_depotlicensegate(ctx))
         emit("RecvPkt", *p2_recvpkt(ctx))
         emit("GetAppIDForCurrentPipe", *p2_appid(ctx))
         emit("GetPipeClient", *p2_pipeclient(ctx))
@@ -871,9 +952,12 @@ def resolve(ctx: Ctx, side: str):
         if bd is None:
             failed.append(("BuildDepotDependency", bderr))
             failed.append(("CheckAppOwnership", f"bd: {bderr}"))
+            failed.append(("DepotLicenseGate", f"BuildDepotDependency: {bderr}"))
         else:
             emit("BuildDepotDependency", bd, None)
-            emit("CheckAppOwnership", *p2_checkapp(ctx, cm))
+            checkapp, checkerr = p2_checkapp(ctx, cm)
+            emit("CheckAppOwnership", checkapp, checkerr)
+            emit("DepotLicenseGate", *p2_depotlicensegate(ctx, bd, checkapp))
         emit("SendCallbackToPipe", *p2_scb(ctx))
         emit("GetPackageInfo", *p2_getpackageinfo(ctx))
     return found, failed

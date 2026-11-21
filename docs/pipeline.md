@@ -20,10 +20,13 @@ Blocked-run triage notes:
 - `steamclient` anchor collisions: candidates can be pinned by prologue
   bytes via `PROLOGUE_PINS` in `tools/resolve_patterns.py` (worked example:
   the 1792192922 beta twins for `CUtlBufferEnsureCapacity`).
-- `DepotLicenseGate` is resolved from its complete .pdata function entry,
-  exact 0x11F-byte unwind extent, and 20-byte prologue. A missing or duplicate
-  candidate fails the whole resolve rather than emitting a stale RVA; review
-  the new build's function boundary before updating this picker.
+- `DepotLicenseGate` is resolved through the `BuildDepotDependency` logical
+  function: follow chained x64 `.pdata` records, collect calls across its hot
+  and cold fragments, then select the unique direct callee that also calls the
+  separately resolved `CheckAppOwnership`. This avoids a version-specific RVA,
+  prologue, or function-size pin. Calls are instruction-decoded inside exact
+  `.pdata` ranges; malformed/cyclic chains and missing or ambiguous topology
+  fail closed and must be reviewed before publishing that build.
 - IPC funcHash/fencepost re-rolls: when a wrapper fails its hash check,
   extract the new constants from the wrapper's outgoing-buffer writes —
   each `mov dword ptr [..], imm32` followed by the 4-byte append helper
@@ -47,6 +50,7 @@ No TOMLs are shipped or fetched — every hook derives from the DLLs alone.
 ## Local run
 
 ```sh
+python3 -m pip install -r requirements.txt
 python3 -m unittest discover -s tests
 python3 tools/fetch_client.py --out bins/ --channels stable beta
 python3 tools/resolve_patterns.py resolve \

@@ -31,6 +31,7 @@ HEADER = ("# HANDROLLED test signature - generated locally by sig-scan of curren
           "# Missing entries omitted on purpose (hook disables gracefully). Do not upstream as-is.\n")
 
 HARDEN_CAP = 80  # max sig length when auto-hardening (CUtlMemoryGrow needed 56)
+INVALID_PDATA_CHAIN = -1  # not an RVA; marks a bad UNW_FLAG_CHAININFO record
 
 
 def harden_sig(toks: list[str], true_rva: int, true_bytes: bytes,
@@ -56,7 +57,7 @@ def sha256_file(path: Path) -> str:
 
 class Image:
     def __init__(self, path: Path):
-        self.buf = open(path, "rb").read()
+        self.buf = path.read_bytes()
         buf = self.buf
         e = struct.unpack_from("<I", buf, 0x3C)[0]
         assert buf[e:e + 4] == b"PE\x00\x00", f"{path} is not a PE"
@@ -83,7 +84,7 @@ class Image:
 
     def pdata_entries(self) -> list[int]:
         off = self.rva2off(self.exc_rva)
-        if off is None:
+        if off is None or self.exc_sz == 0 or self.exc_sz % 12:
             return []
         n = self.exc_sz // 12
         out = set()
@@ -94,15 +95,60 @@ class Image:
 
     def pdata_ranges(self) -> list[tuple[int, int]]:
         """Return valid (begin, end) RVAs from the x64 exception directory."""
+        return [(begin, end) for begin, end, _ in self.pdata_records()]
+
+    def pdata_records(self) -> list[tuple[int, int, int | None]]:
+        """Return (begin, end, chained-parent-begin) runtime-function records.
+
+        A malformed CHAININFO entry uses INVALID_PDATA_CHAIN as its parent
+        marker so consumers do not mistake a broken fragment for a root.
+        """
         off = self.rva2off(self.exc_rva)
         if off is None:
             return []
         n = self.exc_sz // 12
-        out = []
+        runtime_functions = []
         for i in range(n):
-            begin, end, _ = struct.unpack_from("<III", self.buf, off + i * 12)
-            if begin < end:
-                out.append((begin, end))
+            record_off = off + i * 12
+            if record_off + 12 > len(self.buf):
+                break
+            begin, end, unwind = struct.unpack_from("<III", self.buf, record_off)
+            if begin >= end:
+                continue
+            runtime_functions.append((begin, end, unwind))
+
+        by_begin = {begin: (end, unwind)
+                    for begin, end, unwind in runtime_functions}
+        out = []
+        for begin, end, unwind in runtime_functions:
+            parent = None
+            unwind_off = self.rva2off(unwind)
+            if unwind_off is None or unwind_off + 4 > len(self.buf):
+                parent = INVALID_PDATA_CHAIN
+            else:
+                version_and_flags = self.buf[unwind_off]
+                version = version_and_flags & 0x7
+                flags = version_and_flags >> 3
+                code_count = self.buf[unwind_off + 2]
+                codes_end = unwind_off + 4 + code_count * 2
+                if (version not in (1, 2) or flags not in (0, 1, 2, 4)
+                        or codes_end > len(self.buf)):
+                    parent = INVALID_PDATA_CHAIN
+                # UNW_FLAG_CHAININFO appends a RUNTIME_FUNCTION after the
+                # unwind codes, rounded up to an even number of slots.
+                elif flags == 0x4:
+                    # Do not silently treat a malformed chained fragment as
+                    # an independent root; callers must fail closed instead.
+                    parent = INVALID_PDATA_CHAIN
+                    chain_off = unwind_off + 4 + ((code_count + 1) & ~1) * 2
+                    if chain_off + 12 <= len(self.buf):
+                        parent_begin, parent_end, parent_unwind = struct.unpack_from(
+                            "<III", self.buf, chain_off)
+                        if (parent_begin < parent_end and
+                                by_begin.get(parent_begin) == (parent_end,
+                                                               parent_unwind)):
+                            parent = parent_begin
+            out.append((begin, end, parent))
         return sorted(set(out))
 
     def scan(self, sig: list[int | None]) -> list[int]:
