@@ -219,53 +219,139 @@ def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
     """
     from capstone import Cs, CS_ARCH_X86, CS_MODE_64
     from capstone.x86_const import (
-        X86_INS_CALL, X86_INS_LEA, X86_INS_MOV,
+        X86_INS_ADD, X86_INS_CALL, X86_INS_LEA, X86_INS_MOV,
+        X86_INS_POP, X86_INS_PUSH, X86_INS_SUB,
         X86_OP_IMM, X86_OP_MEM, X86_OP_REG,
-        X86_REG_R8D, X86_REG_RBP, X86_REG_RDX, X86_REG_RSP,
+        X86_REG_EAX, X86_REG_ECX, X86_REG_EDX, X86_REG_R8, X86_REG_R8D,
+        X86_REG_R9, X86_REG_R9D, X86_REG_R10, X86_REG_R10D,
+        X86_REG_R11, X86_REG_R11D, X86_REG_RAX, X86_REG_RBP,
+        X86_REG_RCX, X86_REG_RDX, X86_REG_RSP,
     )
 
     md = Cs(CS_ARCH_X86, CS_MODE_64)
     md.detail = True
     instructions = list(md.disasm(code, base_rva))
-    values = []
-    for index, ins in enumerate(instructions):
-        if ins.id != X86_INS_MOV or len(ins.operands) != 2:
-            continue
-        dst, src = ins.operands
-        if (dst.type != X86_OP_MEM or dst.size != 4
-                or dst.mem.base not in (X86_REG_RSP, X86_REG_RBP)
-                or dst.mem.index != 0
-                or src.type != X86_OP_IMM):
-            continue
+    # Track stack-relative aliases and immediate values in registers. Some
+    # compiler versions write an immediate directly to a stack temporary;
+    # others materialize it in a register first. Both are serialized through
+    # the same append call with RDX pointing at the temporary and R8D == 4.
+    aliases = {X86_REG_RSP: 0}
+    constants = {}
+    r8_value = None
+    stack_stores = []
+    before = []
 
-        window_start = max(0, index - 2)
-        window_end = min(len(instructions), index + 7)
-        window = instructions[window_start:window_end]
-        append_ptr = False
-        append_size = False
-        append_call = False
-        for candidate in window:
-            if candidate.address <= ins.address:
-                if (candidate.id == X86_INS_MOV and len(candidate.operands) == 2
-                        and candidate.operands[0].type == X86_OP_REG
-                        and candidate.operands[0].reg == X86_REG_R8D
-                        and candidate.operands[1].type == X86_OP_IMM
-                        and candidate.operands[1].imm == 4):
-                    append_size = True
-                continue
-            if candidate.id == X86_INS_LEA and len(candidate.operands) == 2:
-                dst_reg, src_mem = candidate.operands
-                if (dst_reg.type == X86_OP_REG and dst_reg.reg == X86_REG_RDX
-                        and src_mem.type == X86_OP_MEM
-                        and src_mem.mem.base == dst.mem.base
-                        and src_mem.mem.index == 0
-                        and src_mem.mem.disp == dst.mem.disp):
-                    append_ptr = True
-            elif candidate.id == X86_INS_CALL and append_ptr:
-                append_call = True
+    def stack_offset(mem):
+        if mem.index != 0 or mem.base not in aliases:
+            return None
+        return aliases[mem.base] + mem.disp
+
+    for index, ins in enumerate(instructions):
+        before.append((dict(aliases), r8_value))
+        ops = ins.operands
+
+        # Capture a 32-bit literal written to a stack-local slot.
+        if ins.id == X86_INS_MOV and len(ops) == 2:
+            dst, src = ops
+            if dst.type == X86_OP_MEM and dst.size == 4:
+                offset = stack_offset(dst.mem)
+                value = None
+                if src.type == X86_OP_IMM:
+                    value = src.imm
+                elif src.type == X86_OP_REG and src.reg in constants:
+                    value = constants[src.reg]
+                if offset is not None and value is not None:
+                    stack_stores.append((index, offset, value & 0xFFFFFFFF))
+
+        # Maintain aliases/constants for the common x64 compiler forms.
+        if ins.id == X86_INS_PUSH:
+            if X86_REG_RSP in aliases:
+                aliases[X86_REG_RSP] -= 8
+        elif ins.id == X86_INS_POP:
+            if ops and ops[0].type == X86_OP_REG:
+                aliases.pop(ops[0].reg, None)
+                constants.pop(ops[0].reg, None)
+            if X86_REG_RSP in aliases:
+                aliases[X86_REG_RSP] += 8
+        elif ins.id in (X86_INS_ADD, X86_INS_SUB) and len(ops) == 2 \
+                and ops[0].type == X86_OP_REG and ops[0].reg == X86_REG_RSP \
+                and ops[1].type == X86_OP_IMM and X86_REG_RSP in aliases:
+            delta = ops[1].imm * (1 if ins.id == X86_INS_ADD else -1)
+            aliases[X86_REG_RSP] += delta
+
+        if ops and ops[0].type == X86_OP_REG:
+            dst_reg = ops[0].reg
+            adjusts_rsp = dst_reg == X86_REG_RSP and ins.id in (
+                X86_INS_ADD, X86_INS_SUB)
+            if not adjusts_rsp:
+                aliases.pop(dst_reg, None)
+                constants.pop(dst_reg, None)
+            if dst_reg in (X86_REG_R8, X86_REG_R8D):
+                r8_value = None
+            if ins.id == X86_INS_MOV and len(ops) == 2:
+                src = ops[1]
+                if src.type == X86_OP_IMM:
+                    constants[dst_reg] = src.imm & 0xFFFFFFFF
+                elif src.type == X86_OP_REG:
+                    if src.reg in aliases:
+                        aliases[dst_reg] = aliases[src.reg]
+                    if src.reg in constants:
+                        constants[dst_reg] = constants[src.reg]
+                elif src.type == X86_OP_MEM:
+                    offset = stack_offset(src.mem)
+                    if offset is not None:
+                        aliases[dst_reg] = offset
+            elif ins.id == X86_INS_LEA and len(ops) == 2 \
+                    and ops[1].type == X86_OP_MEM:
+                offset = stack_offset(ops[1].mem)
+                if offset is not None:
+                    aliases[dst_reg] = offset
+            if dst_reg == X86_REG_R8D and ins.id == X86_INS_MOV \
+                    and len(ops) == 2 and ops[1].type == X86_OP_IMM:
+                r8_value = ops[1].imm & 0xFFFFFFFF
+
+        # Calls clobber Windows x64 volatile registers. Preserve the snapshot
+        # above for matching the current append call, then discard aliases and
+        # literals that cannot be trusted after it returns.
+        if ins.id == X86_INS_CALL:
+            for reg in (X86_REG_RAX, X86_REG_EAX, X86_REG_RCX,
+                        X86_REG_ECX, X86_REG_RDX, X86_REG_EDX,
+                        X86_REG_R8, X86_REG_R8D, X86_REG_R9, X86_REG_R9D,
+                        X86_REG_R10, X86_REG_R10D, X86_REG_R11, X86_REG_R11D):
+                aliases.pop(reg, None)
+                constants.pop(reg, None)
+            r8_value = None
+
+    values = []
+    for store_index, slot, value in stack_stores:
+        aliases_at_store, _ = before[store_index]
+        append_ptr = aliases_at_store.get(X86_REG_RDX) == slot
+        for index in range(store_index + 1,
+                           min(len(instructions), store_index + 9)):
+            ins = instructions[index]
+            aliases_before, r8_before = before[index]
+            ops = ins.operands
+
+            # A serialized u32 must be passed by its stack address in RDX.
+            writes_rdx = bool(ops and ops[0].type == X86_OP_REG
+                              and ops[0].reg in (X86_REG_RDX, X86_REG_EDX))
+            if writes_rdx:
+                append_ptr = aliases_before.get(X86_REG_RDX) == slot
+                if ins.id == X86_INS_LEA and len(ops) == 2 \
+                        and ops[1].type == X86_OP_MEM:
+                    offset = aliases_before.get(ops[1].mem.base)
+                    if (offset is not None and ops[1].mem.index == 0
+                            and offset + ops[1].mem.disp == slot):
+                        append_ptr = True
+                elif ins.id == X86_INS_MOV and len(ops) == 2 \
+                        and ops[1].type == X86_OP_REG:
+                    append_ptr = aliases_before.get(ops[1].reg) == slot
+
+            if ins.id == X86_INS_CALL:
+                if append_ptr and r8_before == 4:
+                    values.append(value)
                 break
-        if append_ptr and append_size and append_call:
-            values.append(src.imm & 0xFFFFFFFF)
+
     return values
 
 

@@ -28,10 +28,10 @@ Blocked-run triage notes:
   `.pdata` ranges; malformed/cyclic chains and missing or ambiguous topology
   fail closed and must be reviewed before publishing that build.
 - IPC funcHash/fencepost re-rolls: every method derives its two serialized
-  u32 constants from the wrapper selected through that build's vtable. This
-  avoids stale channel-specific seeds. If extraction fails, inspect the
-  wrapper's outgoing-buffer writes: each stack `mov dword ptr [..], imm32`
-  followed by the 4-byte append helper (`call <helper>`).
+  u32 constants from the wrapper selected through that build's vtable. The
+  extractor handles direct stack immediates and immediate-to-register spills,
+  avoiding stale channel-specific seeds. If extraction fails, inspect the
+  wrapper's outgoing-buffer writes and extend the validated instruction shapes.
 - Phase-2 window misses: `p2_findcreate` scans the 64KB page holding
   `KeyValues_ReadAsBinary`, assuming the KeyValues helpers stay on one page.
   When the block shifts and the two land on opposite sides of a boundary

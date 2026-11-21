@@ -134,10 +134,37 @@ class TestExtractWireConstants(unittest.TestCase):
                     + bytes.fromhex("48 8D 55 20 48 8D 4D 30"
                                     " E8 00 00 00 00"))
 
-        code = append_u32(0xD6FC3200) + append_u32(0xD7058CA5)
+        code = (bytes.fromhex("55 48 89 E5 48 83 EC 60")
+                + append_u32(0xD6FC3200)
+                + append_u32(0xD7058CA5))
         self.assertEqual(
             ri.extract_serialized_u32_constants(code, 0x1000),
             [0xD6FC3200, 0xD7058CA5])
+
+    def test_extracts_immediate_materialized_in_register_then_spilled(self):
+        def append_u32(value):
+            return (bytes.fromhex("41 B8 04 00 00 00 B8")
+                    + value.to_bytes(4, "little")
+                    + bytes.fromhex("89 44 24 20 48 8D 54 24 20"
+                                    " E8 00 00 00 00"))
+
+        code = (bytes.fromhex("48 83 EC 60")
+                + append_u32(0x09607EC0)
+                + append_u32(0x0AFF7152))
+        self.assertEqual(
+            ri.extract_serialized_u32_constants(code, 0x1000),
+            [0x09607EC0, 0x0AFF7152])
+
+    def test_does_not_reuse_r8d_length_across_append_calls(self):
+        code = (bytes.fromhex(
+                    "48 83 EC 60 41 B8 04 00 00 00 "
+                    "C7 44 24 20 11 22 33 44 "
+                    "48 8D 54 24 20 E8 00 00 00 00 "
+                    "C7 44 24 28 55 66 77 88 "
+                    "48 8D 54 24 28 E8 00 00 00 00"))
+        self.assertEqual(
+            ri.extract_serialized_u32_constants(code, 0x1000),
+            [0x44332211])
 
 
 class TestResolveIface(unittest.TestCase):
@@ -174,7 +201,7 @@ class TestResolveIface(unittest.TestCase):
                     + bytes.fromhex("48 8D 54 24 20 48 8D 4C 24 30"
                                     " E8 00 00 00 00"))
 
-        code = (bytes.fromhex("B8 11 22 33 44")
+        code = (bytes.fromhex("55 48 89 E5 48 83 EC 60 B8 11 22 33 44")
                 + append_u32(0x12345678)
                 + append_u32(0xABCDEF01))
         img.put(WRAP, code)
@@ -199,7 +226,9 @@ class TestResolveIface(unittest.TestCase):
                     + bytes.fromhex("48 8D 55 20 48 8D 4D 30"
                                     " E8 00 00 00 00"))
 
-        code = append_u32(0x11223344) + append_u32(0x55667788)
+        code = (bytes.fromhex("55 48 89 E5 48 83 EC 60")
+                + append_u32(0x11223344)
+                + append_u32(0x55667788))
         img.put(WRAP, code)
         spec = {**self.SPEC, "methods": list(self.SPEC["methods"])}
         vt, methods, err = ri.resolve_iface(
