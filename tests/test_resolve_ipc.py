@@ -190,6 +190,37 @@ class TestWrapperDiagnostics(unittest.TestCase):
         self.assertIn("ret", text)
 
 
+class TestPdataFamilies(unittest.TestCase):
+    def test_groups_chained_fragments_by_primary_entry(self):
+        class Img:
+            @staticmethod
+            def pdata_records():
+                return [(0x1000, 0x1010, None),
+                        (0x1100, 0x1110, 0x1000),
+                        (0x2000, 0x2010, None)]
+
+        self.assertEqual(ri.pdata_families(Img()), {
+            0x1000: [0x1000, 0x1100],
+            0x2000: [0x2000],
+        })
+
+    def test_serialized_constants_are_collected_from_chained_fragment(self):
+        img = FlatImg()
+        root, cold = 0x5000, 0x5010
+        img.put(root, b"\xC3")
+        code = (bytes.fromhex("48 83 EC 60")
+                + bytes.fromhex("41 B8 04 00 00 00 C7 44 24 20")
+                + bytes.fromhex("78 56 34 12 48 8D 54 24 20 E8 00 00 00 00")
+                + bytes.fromhex("41 B8 04 00 00 00 C7 44 24 20")
+                + bytes.fromhex("F1 DE BC 9A 48 8D 54 24 20 E8 00 00 00 00"))
+        img.put(cold, code)
+        self.assertEqual(
+            ri.serialized_u32_constants(
+                img, root, {root: 1, cold: len(code)},
+                {root: [root, cold]}),
+            [0x12345678, 0x9ABCDEF1])
+
+
 class TestResolveIface(unittest.TestCase):
     SPEC = {"id": 1, "td": TD,
             "methods": [("GetSteamID", 10, "D6FC3200", "D7058CA5", 0)]}

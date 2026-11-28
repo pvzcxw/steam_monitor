@@ -10,8 +10,9 @@ extracted from the wrapper selected through this build's vtable; GetSteamID
 has a narrow, wrapper-hash-validated channel-seed fallback for unrecognized
 codegen. Re-derive on failure: inspect the slot's wrapper, find each
 `mov dword ptr [..], imm32` followed by the 4-byte append helper call; first
-immediate = funcHash, second = fencepost. Only the two RVAs resolve per
-build. Resolution chain per interface, all asserted unique (FAIL loudly):
+immediate = funcHash, second = fencepost. Wrapper RVAs and wire pairs are
+resolved per build. Resolution chain per interface, all asserted unique (FAIL
+loudly):
 
   RTTI TypeDescriptor name (pinned, e.g. .?AVIClientUserMap@@)
     -> Complete Object Locator (sig == 1, pTD == TD)
@@ -116,6 +117,50 @@ def data_spans(img):
             if name in (b".rdata", b".data")]
 
 
+def pdata_families(img):
+    """Group chained x64 exception records by their primary function."""
+    records = {
+        begin: (end, parent)
+        for begin, end, parent in img.pdata_records()
+    }
+    roots = {}
+
+    def root(begin):
+        if begin in roots:
+            return roots[begin]
+        path = []
+        seen = set()
+        current = begin
+        while current in records and current not in seen:
+            if current in roots:
+                resolved = roots[current]
+                break
+            seen.add(current)
+            path.append(current)
+            parent = records[current][1]
+            if parent is None:
+                resolved = current
+                break
+            if parent not in records:
+                resolved = None
+                break
+            current = parent
+        else:
+            resolved = None
+        for item in path:
+            roots[item] = resolved
+        return resolved
+
+    families = {}
+    for begin in records:
+        primary = root(begin)
+        if primary is not None:
+            families.setdefault(primary, []).append(begin)
+    for family in families.values():
+        family.sort()
+    return families
+
+
 def span_bytes(img, rva, size):
     """Contiguous bytes for [rva, rva+size), crossing sections if needed."""
     out = bytearray()
@@ -195,20 +240,33 @@ def find_vtable(img, spans, td_rva, base):
     return next(iter(match)), None
 
 
+def _family_for(func_rva, pdata_families):
+    if pdata_families is None:
+        return [func_rva]
+    for family in pdata_families.values():
+        if func_rva in family:
+            return family
+    return [func_rva]
+
+
 def check_wrapper(img, func_rva, funchash: str, pdata,
-                  pdata_sizes=None) -> bool:
+                  pdata_sizes=None, pdata_families=None) -> bool:
     if func_rva not in pdata:
         return False
-    o = img.rva2off(func_rva)
-    if o is None:
-        return False
-    window = HASH_WINDOW
-    if pdata_sizes is not None:
-        size = pdata_sizes.get(func_rva, 0)
-        if size <= 0:
-            return False
-        window = min(window, size)
-    return bytes.fromhex(funchash)[::-1] in bytes(img.buf[o:o + window])
+    needle = bytes.fromhex(funchash)[::-1]
+    for fragment in _family_for(func_rva, pdata_families):
+        o = img.rva2off(fragment)
+        if o is None:
+            continue
+        window = HASH_WINDOW
+        if pdata_sizes is not None:
+            size = pdata_sizes.get(fragment, 0)
+            if size <= 0:
+                continue
+            window = min(window, size)
+        if needle in bytes(img.buf[o:o + window]):
+            return True
+    return False
 
 
 def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
@@ -369,37 +427,47 @@ def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
     return values
 
 
-def serialized_u32_constants(img, func_rva, pdata_sizes):
-    size = pdata_sizes.get(func_rva, 0)
-    off = img.rva2off(func_rva)
-    if size <= 0 or off is None:
-        return []
-    end = min(off + size, len(img.buf))
-    return extract_serialized_u32_constants(
-        bytes(img.buf[off:end]), func_rva)
+def serialized_u32_constants(img, func_rva, pdata_sizes, pdata_families=None):
+    values = []
+    for fragment in _family_for(func_rva, pdata_families):
+        size = pdata_sizes.get(fragment, 0)
+        off = img.rva2off(fragment)
+        if size <= 0 or off is None:
+            continue
+        end = min(off + size, len(img.buf))
+        values.extend(extract_serialized_u32_constants(
+            bytes(img.buf[off:end]), fragment))
+    return values
 
 
-def describe_wrapper(img, func_rva, pdata_sizes, max_instructions=96):
+def describe_wrapper(img, func_rva, pdata_sizes, pdata_families=None,
+                     max_instructions=96):
     """Compact disassembly for failed IPC resolution triage logs."""
-    size = pdata_sizes.get(func_rva, 0)
-    off = img.rva2off(func_rva)
-    if size <= 0 or off is None:
-        return f"wrapper extent unavailable (pdata_size={size:#x}, offset={off})"
     from capstone import Cs, CS_ARCH_X86, CS_MODE_64
 
     md = Cs(CS_ARCH_X86, CS_MODE_64)
-    code = bytes(img.buf[off:min(off + size, len(img.buf))])
-    lines = [f"wrapper extent: rva={func_rva:#x} size={len(code):#x}"]
-    for index, ins in enumerate(md.disasm(code, func_rva)):
-        if index >= max_instructions:
-            lines.append("... disassembly truncated ...")
-            break
-        raw = ins.bytes.hex(" ")
-        lines.append(f"{ins.address:08X}: {raw:<32} {ins.mnemonic} {ins.op_str}".rstrip())
+    lines = []
+    count = 0
+    for fragment in _family_for(func_rva, pdata_families):
+        size = pdata_sizes.get(fragment, 0)
+        off = img.rva2off(fragment)
+        if size <= 0 or off is None:
+            lines.append(f"wrapper fragment unavailable: rva={fragment:#x}")
+            continue
+        code = bytes(img.buf[off:min(off + size, len(img.buf))])
+        lines.append(f"wrapper extent: rva={fragment:#x} size={len(code):#x}")
+        for ins in md.disasm(code, fragment):
+            if count >= max_instructions:
+                lines.append("... disassembly truncated ...")
+                return "\n".join(lines)
+            raw = ins.bytes.hex(" ")
+            lines.append(f"{ins.address:08X}: {raw:<32} {ins.mnemonic} {ins.op_str}".rstrip())
+            count += 1
     return "\n".join(lines)
 
 
-def resolve_iface(spec, img, spans, base, pdata, pdata_sizes=None):
+def resolve_iface(spec, img, spans, base, pdata, pdata_sizes=None,
+                  pdata_families=None):
     td = find_td(img, spans, spec["td"])
     if td is None:
         return None, None, f'no TD {spec["td"]!r}'
@@ -420,7 +488,8 @@ def resolve_iface(spec, img, spans, base, pdata, pdata_sizes=None):
         # are loaded from registers, so only the two serialized immediates
         # (funcHash, fencepost) are returned by the extractor.
         if pdata_sizes is not None:
-            wire = serialized_u32_constants(img, f, pdata_sizes)
+            wire = serialized_u32_constants(
+                img, f, pdata_sizes, pdata_families)
             if len(wire) == 2:
                 funchash, fence = (f"{wire[0]:08X}", f"{wire[1]:08X}")
                 methods_spec = list(spec["methods"])
@@ -428,7 +497,7 @@ def resolve_iface(spec, img, spans, base, pdata, pdata_sizes=None):
                 spec["methods"] = methods_spec
                 spec.setdefault("wire_constants_updated", []).append(name)
             elif name == "GetSteamID" and check_wrapper(
-                    img, f, funchash, pdata, pdata_sizes):
+                    img, f, funchash, pdata, pdata_sizes, pdata_families):
                 # Known Steam builds keep the GetSteamID wire pair stable,
                 # but some wrapper codegen variants don't expose its stack
                 # literal stores to the generic extractor. Use this narrow
@@ -436,12 +505,14 @@ def resolve_iface(spec, img, spans, base, pdata, pdata_sizes=None):
                 # contains the seeded funcHash; otherwise fail closed.
                 spec.setdefault("wire_constants_fallback", []).append(name)
             else:
-                details = describe_wrapper(img, f, pdata_sizes)
+                details = describe_wrapper(
+                    img, f, pdata_sizes, pdata_families)
                 return None, None, (
                     f"{name}: couldn't extract funcHash/fencepost from "
                     f"wrapper {f:#x} (found {len(wire)} serialized u32 values)\n"
                     f"{details}")
-        if not check_wrapper(img, f, funchash, pdata, pdata_sizes):
+        if not check_wrapper(
+                img, f, funchash, pdata, pdata_sizes, pdata_families):
             return None, None, f"{name}: wrapper {f:#x} fails hash check"
         methods[name] = f
     return vt, methods, None
@@ -475,11 +546,12 @@ def cmd_resolve(args):
     entries = sorted(begin for begin, _end in pdata_ranges)
     pdata = set(entries)
     pdata_sizes = {begin: end - begin for begin, end in pdata_ranges}
+    families = pdata_families(img)
     resolved, failed = [], []
     for iface, base_spec in IPC_IFACES.items():
         spec = channel_spec(iface, base_spec, args.channel)
         vt, methods, err = resolve_iface(
-            spec, img, spans, base, pdata, pdata_sizes)
+            spec, img, spans, base, pdata, pdata_sizes, families)
         if err is not None:
             failed.append((iface, err))
             print(f"FAIL {iface}: {err}")

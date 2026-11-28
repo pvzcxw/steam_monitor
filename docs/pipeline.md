@@ -30,7 +30,8 @@ Blocked-run triage notes:
 - IPC funcHash/fencepost re-rolls: methods derive their two serialized u32
   constants from the wrapper selected through that build's vtable. `GetSteamID`
   has a narrow channel-seed fallback for codegen variants the extractor cannot
-  decode; it is used only if the selected wrapper contains that seed's funcHash.
+  decode; chained `.pdata` fragments are included before fallback, and the
+  seed is used only if the selected wrapper family contains that funcHash.
   Other extraction failures print the exact `.pdata` extent and bounded
   disassembly to the Actions log.
 - Phase-2 window misses: `p2_findcreate` scans the 64KB page holding
