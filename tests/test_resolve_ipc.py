@@ -141,6 +141,19 @@ class TestExtractWireConstants(unittest.TestCase):
             ri.extract_serialized_u32_constants(code, 0x1000),
             [0xD6FC3200, 0xD7058CA5])
 
+    def test_matches_untracked_rbp_address_and_qword_store(self):
+        def append_u32(value):
+            signed_value = value if value < 0x80000000 else value - 0x100000000
+            return (bytes.fromhex("41 B8 04 00 00 00 48 C7 45 20")
+                    + signed_value.to_bytes(4, "little", signed=True)
+                    + bytes.fromhex("48 8D 55 20 48 8D 4D 30"
+                                    " E8 00 00 00 00"))
+
+        code = append_u32(0x09607EC0) + append_u32(0x0AFF7152)
+        self.assertEqual(
+            ri.extract_serialized_u32_constants(code, 0x1000),
+            [0x09607EC0, 0x0AFF7152])
+
     def test_extracts_immediate_materialized_in_register_then_spilled(self):
         def append_u32(value):
             return (bytes.fromhex("41 B8 04 00 00 00 B8")
@@ -165,6 +178,16 @@ class TestExtractWireConstants(unittest.TestCase):
         self.assertEqual(
             ri.extract_serialized_u32_constants(code, 0x1000),
             [0x44332211])
+
+
+class TestWrapperDiagnostics(unittest.TestCase):
+    def test_failed_wrapper_disassembly_is_bounded_and_addressed(self):
+        img = FlatImg()
+        img.put(WRAP, bytes.fromhex("48 83 EC 20 48 83 C4 20 C3"))
+        text = ri.describe_wrapper(img, WRAP, {WRAP: 9})
+        self.assertIn("wrapper extent: rva=0x6000 size=0x9", text)
+        self.assertIn("sub", text)
+        self.assertIn("ret", text)
 
 
 class TestResolveIface(unittest.TestCase):
@@ -240,6 +263,22 @@ class TestResolveIface(unittest.TestCase):
         self.assertEqual(spec["methods"][0],
                          ("GetSteamID", 10, "11223344", "55667788", 0))
 
+    def test_getsteamid_uses_verified_beta_seed_when_codegen_is_unrecognized(self):
+        img, _ = mkimg()
+        spec = ri.channel_spec(
+            "IClientUser", ri.IPC_IFACES["IClientUser"], "beta")
+        spec["methods"] = spec["methods"][:1]
+
+        vt, methods, err = ri.resolve_iface(
+            spec, img, SPANS, BASE, {WRAP}, {WRAP: 0x100})
+
+        self.assertIsNone(err)
+        self.assertEqual(vt, VT_RVA)
+        self.assertEqual(methods, {"GetSteamID": WRAP})
+        self.assertEqual(spec["methods"][0],
+                         ("GetSteamID", 10, "D6FC3200", "D7058CA5", 0))
+        self.assertEqual(spec["wire_constants_fallback"], ["GetSteamID"])
+
 
 class TestRenderToml(unittest.TestCase):
     def test_schema_matches_upstream(self):
@@ -277,7 +316,9 @@ class TestChannelConstants(unittest.TestCase):
         self.assertEqual(stable["methods"][0],
                          ("GetAppID", 19, "09607EC4", "0AFE7552", 0))
         self.assertEqual(beta["methods"][0],
-                         ("GetAppID", 19, "09607EC2", "0AFEF352", 0))
+                         ("GetAppID", 19, "09607EC0", "0AFF7152", 0))
+        self.assertEqual(beta["methods"][1],
+                         ("GetAPICallResult", 24, "2D3D397B", "2EE05B1E", 3))
 
 
 if __name__ == "__main__":

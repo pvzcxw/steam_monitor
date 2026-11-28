@@ -5,9 +5,10 @@ per-interface [Name] (interface_id, vtable_rva) plus per-method
 [Name.Method] (method_index, funcHash, wrapper_rva, fencepost, argc).
 
 funcHash / fencepost values are wire constants the wrapper writes into the
-outgoing IPC buffer (4-byte appends). They are NOT build-stable. Every pair
-is extracted from the wrapper selected through this build's vtable. Re-derive
-on failure: inspect the slot's wrapper, find each
+outgoing IPC buffer (4-byte appends). They are NOT build-stable. Pairs are
+extracted from the wrapper selected through this build's vtable; GetSteamID
+has a narrow, wrapper-hash-validated channel-seed fallback for unrecognized
+codegen. Re-derive on failure: inspect the slot's wrapper, find each
 `mov dword ptr [..], imm32` followed by the 4-byte append helper call; first
 immediate = funcHash, second = fencepost. Only the two RVAs resolve per
 build. Resolution chain per interface, all asserted unique (FAIL loudly):
@@ -87,8 +88,8 @@ IPC_CONSTANTS = {
             "GetEncryptedAppTicket": ("25D6BB1C", "2646F563"),
         },
         "IClientUtils": {
-            "GetAppID": ("09607EC2", "0AFEF352"),
-            "GetAPICallResult": ("2D3D3979", "2EDFDD1A"),
+            "GetAppID": ("09607EC0", "0AFF7152"),
+            "GetAPICallResult": ("2D3D397B", "2EE05B1E"),
         },
     },
 }
@@ -246,6 +247,12 @@ def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
             return None
         return aliases[mem.base] + mem.disp
 
+    def address_key(mem):
+        """Register-relative address identity, even without a known stack root."""
+        if mem.base == 0 or mem.index != 0:
+            return None
+        return mem.base, mem.index, mem.scale, mem.disp
+
     for index, ins in enumerate(instructions):
         before.append((dict(aliases), r8_value))
         ops = ins.operands
@@ -253,15 +260,17 @@ def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
         # Capture a 32-bit literal written to a stack-local slot.
         if ins.id == X86_INS_MOV and len(ops) == 2:
             dst, src = ops
-            if dst.type == X86_OP_MEM and dst.size == 4:
+            if dst.type == X86_OP_MEM and dst.size in (4, 8):
                 offset = stack_offset(dst.mem)
+                key = address_key(dst.mem)
                 value = None
                 if src.type == X86_OP_IMM:
                     value = src.imm
                 elif src.type == X86_OP_REG and src.reg in constants:
                     value = constants[src.reg]
-                if offset is not None and value is not None:
-                    stack_stores.append((index, offset, value & 0xFFFFFFFF))
+                if key is not None and value is not None:
+                    stack_stores.append((index, offset, key,
+                                         value & 0xFFFFFFFF))
 
         # Maintain aliases/constants for the common x64 compiler forms.
         if ins.id == X86_INS_PUSH:
@@ -323,9 +332,10 @@ def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
             r8_value = None
 
     values = []
-    for store_index, slot, value in stack_stores:
+    for store_index, slot, store_address, value in stack_stores:
         aliases_at_store, _ = before[store_index]
-        append_ptr = aliases_at_store.get(X86_REG_RDX) == slot
+        append_ptr = (slot is not None
+                      and aliases_at_store.get(X86_REG_RDX) == slot)
         for index in range(store_index + 1,
                            min(len(instructions), store_index + 9)):
             ins = instructions[index]
@@ -336,12 +346,16 @@ def extract_serialized_u32_constants(code: bytes, base_rva: int) -> list[int]:
             writes_rdx = bool(ops and ops[0].type == X86_OP_REG
                               and ops[0].reg in (X86_REG_RDX, X86_REG_EDX))
             if writes_rdx:
-                append_ptr = aliases_before.get(X86_REG_RDX) == slot
+                append_ptr = (slot is not None
+                              and aliases_before.get(X86_REG_RDX) == slot)
                 if ins.id == X86_INS_LEA and len(ops) == 2 \
                         and ops[1].type == X86_OP_MEM:
                     offset = aliases_before.get(ops[1].mem.base)
-                    if (offset is not None and ops[1].mem.index == 0
-                            and offset + ops[1].mem.disp == slot):
+                    same_address = address_key(ops[1].mem) == store_address
+                    if same_address or (offset is not None
+                                        and ops[1].mem.index == 0
+                                        and slot is not None
+                                        and offset + ops[1].mem.disp == slot):
                         append_ptr = True
                 elif ins.id == X86_INS_MOV and len(ops) == 2 \
                         and ops[1].type == X86_OP_REG:
@@ -363,6 +377,26 @@ def serialized_u32_constants(img, func_rva, pdata_sizes):
     end = min(off + size, len(img.buf))
     return extract_serialized_u32_constants(
         bytes(img.buf[off:end]), func_rva)
+
+
+def describe_wrapper(img, func_rva, pdata_sizes, max_instructions=96):
+    """Compact disassembly for failed IPC resolution triage logs."""
+    size = pdata_sizes.get(func_rva, 0)
+    off = img.rva2off(func_rva)
+    if size <= 0 or off is None:
+        return f"wrapper extent unavailable (pdata_size={size:#x}, offset={off})"
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_64
+
+    md = Cs(CS_ARCH_X86, CS_MODE_64)
+    code = bytes(img.buf[off:min(off + size, len(img.buf))])
+    lines = [f"wrapper extent: rva={func_rva:#x} size={len(code):#x}"]
+    for index, ins in enumerate(md.disasm(code, func_rva)):
+        if index >= max_instructions:
+            lines.append("... disassembly truncated ...")
+            break
+        raw = ins.bytes.hex(" ")
+        lines.append(f"{ins.address:08X}: {raw:<32} {ins.mnemonic} {ins.op_str}".rstrip())
+    return "\n".join(lines)
 
 
 def resolve_iface(spec, img, spans, base, pdata, pdata_sizes=None):
@@ -387,15 +421,26 @@ def resolve_iface(spec, img, spans, base, pdata, pdata_sizes=None):
         # (funcHash, fencepost) are returned by the extractor.
         if pdata_sizes is not None:
             wire = serialized_u32_constants(img, f, pdata_sizes)
-            if len(wire) != 2:
+            if len(wire) == 2:
+                funchash, fence = (f"{wire[0]:08X}", f"{wire[1]:08X}")
+                methods_spec = list(spec["methods"])
+                methods_spec[method_index] = (name, idx, funchash, fence, argc)
+                spec["methods"] = methods_spec
+                spec.setdefault("wire_constants_updated", []).append(name)
+            elif name == "GetSteamID" and check_wrapper(
+                    img, f, funchash, pdata, pdata_sizes):
+                # Known Steam builds keep the GetSteamID wire pair stable,
+                # but some wrapper codegen variants don't expose its stack
+                # literal stores to the generic extractor. Use this narrow
+                # channel seed fallback only when the selected wrapper itself
+                # contains the seeded funcHash; otherwise fail closed.
+                spec.setdefault("wire_constants_fallback", []).append(name)
+            else:
+                details = describe_wrapper(img, f, pdata_sizes)
                 return None, None, (
                     f"{name}: couldn't extract funcHash/fencepost from "
-                    f"wrapper {f:#x} (found {len(wire)} serialized u32 values)")
-            funchash, fence = (f"{wire[0]:08X}", f"{wire[1]:08X}")
-            methods_spec = list(spec["methods"])
-            methods_spec[method_index] = (name, idx, funchash, fence, argc)
-            spec["methods"] = methods_spec
-            spec.setdefault("wire_constants_updated", []).append(name)
+                    f"wrapper {f:#x} (found {len(wire)} serialized u32 values)\n"
+                    f"{details}")
         if not check_wrapper(img, f, funchash, pdata, pdata_sizes):
             return None, None, f"{name}: wrapper {f:#x} fails hash check"
         methods[name] = f
@@ -446,6 +491,10 @@ def cmd_resolve(args):
                 values = next(m for m in spec["methods"] if m[0] == method)
                 print(f"AUTO {iface}.{method}: funcHash=0x{values[2]} "
                       f"fencepost=0x{values[3]}")
+            for method in spec.get("wire_constants_fallback", ()):
+                values = next(m for m in spec["methods"] if m[0] == method)
+                print(f"SEED {iface}.{method}: funcHash=0x{values[2]} "
+                      f"fencepost=0x{values[3]} (wrapper hash verified)")
     if args.verify:
         truth = tomllib.load(open(args.verify, "rb"))
         for iface, spec, vt, methods in resolved:

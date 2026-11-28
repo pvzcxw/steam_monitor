@@ -27,11 +27,12 @@ Blocked-run triage notes:
   prologue, or function-size pin. Calls are instruction-decoded inside exact
   `.pdata` ranges; malformed/cyclic chains and missing or ambiguous topology
   fail closed and must be reviewed before publishing that build.
-- IPC funcHash/fencepost re-rolls: every method derives its two serialized
-  u32 constants from the wrapper selected through that build's vtable. The
-  extractor handles direct stack immediates and immediate-to-register spills,
-  avoiding stale channel-specific seeds. If extraction fails, inspect the
-  wrapper's outgoing-buffer writes and extend the validated instruction shapes.
+- IPC funcHash/fencepost re-rolls: methods derive their two serialized u32
+  constants from the wrapper selected through that build's vtable. `GetSteamID`
+  has a narrow channel-seed fallback for codegen variants the extractor cannot
+  decode; it is used only if the selected wrapper contains that seed's funcHash.
+  Other extraction failures print the exact `.pdata` extent and bounded
+  disassembly to the Actions log.
 - Phase-2 window misses: `p2_findcreate` scans the 64KB page holding
   `KeyValues_ReadAsBinary`, assuming the KeyValues helpers stay on one page.
   When the block shifts and the two land on opposite sides of a boundary
